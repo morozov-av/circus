@@ -6,14 +6,37 @@ const { JSDOM } = require('jsdom');
 const BOT_TOKEN = 'REDACTED';
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// Хранилище активных проверок для каждого чата
-const activeChecks = new Map();
+// Хранилище подписанных чатов
+const subscribedChats = new Set();
 // Кэш результатов проверки событий
 const resultsCache = new Map();
 // Предыдущие результаты для сравнения
 const previousResults = new Map();
-// Флаг, указывающий на выполнение цикла проверки
-let checkingInProgress = false;
+// Глобальный цикл проверки
+let globalCheckInterval = null;
+// Флаг выполнения проверки прямо сейчас
+let isCheckRunning = false;
+
+// Функция для создания клавиатуры с кнопками
+function getKeyboard(isSubscribed) {
+    const keyboard = {
+        inline_keyboard: []
+    };
+
+    if (isSubscribed) {
+        keyboard.inline_keyboard.push([
+            { text: '🛑 Стоп', callback_data: 'stop' },
+            { text: '📊 Статус', callback_data: 'status' }
+        ]);
+    } else {
+        keyboard.inline_keyboard.push([
+            { text: '🚀 Старт', callback_data: 'start' },
+            { text: '📊 Статус', callback_data: 'status' }
+        ]);
+    }
+
+    return keyboard;
+}
 
 async function checkEvent(eventId) {
     try {
@@ -106,13 +129,19 @@ function compareResults(newResult, oldResult) {
 }
 
 async function performChecks() {
+    if (isCheckRunning) {
+        console.log('⚠️ Проверка уже выполняется, пропускаю...');
+        return;
+    }
+
+    isCheckRunning = true;
     const range = [41818, 41883];
 
     console.log('🔄 Начинаю новый цикл проверки...');
-    checkingInProgress = true;
     const newResults = new Map();
 
-    for (let eventId = range[1]; eventId >= range[0]; eventId--) {
+    try {
+        for (let eventId = range[1]; eventId >= range[0]; eventId--) {
         console.log(`Проверяю событие https://www.ticketpro.by/kupit-bilet/${eventId}/ ...`);
 
         const result = await checkEvent(eventId);
@@ -136,13 +165,27 @@ async function performChecks() {
             }
         }
 
-        await delay(15000);
-    }
+            await delay(5000);
+        }
 
-    resultsCache.clear();
-    resultsCache.set('changes', newResults);
-    checkingInProgress = false;
-    console.log(`✅ Цикл проверки завершен. Найдено изменений: ${newResults.size}`);
+        resultsCache.clear();
+        resultsCache.set('changes', newResults);
+        console.log(`✅ Цикл проверки завершен. Найдено изменений: ${newResults.size}`);
+
+        // Уведомляем всех подписанных пользователей об изменениях
+        if (newResults.size > 0) {
+            for (const chatId of subscribedChats) {
+                try {
+                    await bot.sendMessage(chatId, '🔔 Обнаружены новые изменения!');
+                    await sendCachedResults(chatId, false);
+                } catch (error) {
+                    console.error(`Ошибка отправки сообщения в чат ${chatId}:`, error.message);
+                }
+            }
+        }
+    } finally {
+        isCheckRunning = false;
+    }
 }
 
 async function sendCachedResults(chatId, isFirstRun = false) {
@@ -187,100 +230,169 @@ async function sendCachedResults(chatId, isFirstRun = false) {
     }
 }
 
-async function runChecks(chatId) {
-    let isFirstRun = true;
+async function startGlobalChecks() {
+    if (globalCheckInterval) {
+        console.log('⚠️ Глобальная проверка уже запущена');
+        return;
+    }
 
-    while (activeChecks.get(chatId)) {
-        // Если проверка уже идет, используем кэш
-        if (checkingInProgress) {
-            await bot.sendMessage(chatId, '⏳ Проверка уже выполняется, ожидайте...');
+    console.log('🚀 Запускаю глобальный цикл проверки для всех пользователей');
 
-            // Ждем завершения проверки
-            while (checkingInProgress && activeChecks.get(chatId)) {
-                await delay(5000);
-            }
-
-            if (!activeChecks.get(chatId)) {
-                return;
-            }
-        }
-
-        // Отправляем результаты только при первом запуске или если есть изменения
-        const changes = resultsCache.get('changes');
-        if (changes && changes.size > 0) {
-            if (isFirstRun) {
-                await bot.sendMessage(chatId, '📦 Отправляю текущие результаты...');
-            } else {
-                await bot.sendMessage(chatId, '🔔 Обнаружены изменения!');
-            }
-            await sendCachedResults(chatId, isFirstRun);
-        } else if (isFirstRun) {
-            await bot.sendMessage(chatId, '📭 Свободных мест пока не найдено');
-        }
-
-        isFirstRun = false;
-
-        // Запускаем новую проверку
-        //await bot.sendMessage(chatId, '🔍 Запускаю новую проверку...');
-        await performChecks();
-
-        if (!activeChecks.get(chatId)) {
-            await bot.sendMessage(chatId, '⏹ Проверка остановлена');
+    // Запускаем проверки по интервалу
+    // ВАЖНО: НЕ вызываем performChecks() сразу, чтобы не дублировать запросы для каждого нового пользователя
+    globalCheckInterval = setInterval(async () => {
+        if (subscribedChats.size === 0) {
+            console.log('⏹ Нет подписанных пользователей, останавливаю глобальную проверку');
+            stopGlobalChecks();
             return;
         }
 
-        // Отправляем результаты только если есть изменения
-        const newChanges = resultsCache.get('changes');
-        if (newChanges && newChanges.size > 0) {
-            await bot.sendMessage(chatId, '🔔 Новые изменения:');
-            await sendCachedResults(chatId, false);
-        } else {
-            //await bot.sendMessage(chatId, '✅ Проверка завершена. Изменений не обнаружено.');
-        }
+        await performChecks();
+    }, 60000); // Проверка каждые 60 секунд (можно настроить)
+
+    // Запускаем первую проверку сразу, НО только если это первый запуск (нет кэша)
+    if (resultsCache.size === 0 && previousResults.size === 0) {
+        console.log('📋 Первый запуск - выполняю начальную проверку');
+        await performChecks();
+    }
+}
+
+function stopGlobalChecks() {
+    if (globalCheckInterval) {
+        clearInterval(globalCheckInterval);
+        globalCheckInterval = null;
+        console.log('⏹ Глобальная проверка остановлена');
     }
 }
 
 bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
+    const isSubscribed = subscribedChats.has(chatId);
 
-    if (activeChecks.get(chatId)) {
-        await bot.sendMessage(chatId, '⚠️ Проверка уже запущена! Используйте /stop для остановки.');
-        return;
-    }
+    const welcomeMessage = `🎭 Добро пожаловать в бот мониторинга билетов!
 
-    activeChecks.set(chatId, true);
-    await bot.sendMessage(chatId, '🚀 Начинаю непрерывную проверку билетов...\nБуду уведомлять только об изменениях.\nИспользуйте /stop для остановки.');
+Я буду отслеживать доступность билетов и уведомлять вас об изменениях.
 
-    runChecks(chatId).catch(error => {
-        console.error(error);
-        bot.sendMessage(chatId, `Ошибка: ${error.message}`);
-        activeChecks.delete(chatId);
+${isSubscribed ? '✅ Вы уже подписаны на уведомления' : '⭕️ Вы пока не подписаны'}
+
+Используйте кнопки ниже для управления:`;
+
+    await bot.sendMessage(chatId, welcomeMessage, {
+        reply_markup: getKeyboard(isSubscribed)
     });
 });
 
-bot.onText(/\/stop/, async (msg) => {
-    const chatId = msg.chat.id;
+// Обработчик callback-кнопок
+bot.on('callback_query', async (query) => {
+    const chatId = query.message.chat.id;
+    const messageId = query.message.message_id;
+    const action = query.data;
 
-    if (!activeChecks.get(chatId)) {
-        await bot.sendMessage(chatId, '⚠️ Проверка не запущена!');
-        return;
+    try {
+        if (action === 'start') {
+            // Подписка на уведомления
+            if (subscribedChats.has(chatId)) {
+                await bot.answerCallbackQuery(query.id, {
+                    text: '⚠️ Вы уже подписаны!',
+                    show_alert: false
+                });
+                return;
+            }
+
+            subscribedChats.add(chatId);
+
+            // Обновляем сообщение с новыми кнопками
+            await bot.editMessageText(
+                '✅ Вы подписались на уведомления о доступных билетах!\nБуду уведомлять вас об изменениях.',
+                {
+                    chat_id: chatId,
+                    message_id: messageId,
+                    reply_markup: getKeyboard(true)
+                }
+            );
+
+            // Если есть кэшированные результаты, отправляем их
+            const changes = resultsCache.get('changes');
+            if (changes && changes.size > 0) {
+                await bot.sendMessage(chatId, '📦 Отправляю текущие доступные билеты:');
+                await sendCachedResults(chatId, true);
+            } else {
+                await bot.sendMessage(chatId, '📭 Свободных мест пока не найдено');
+            }
+
+            // Запускаем глобальную проверку, если она еще не запущена
+            if (!globalCheckInterval) {
+                await bot.sendMessage(chatId, '🔄 Запускаю мониторинг билетов...');
+                startGlobalChecks().catch(error => {
+                    console.error('Ошибка глобальной проверки:', error);
+                    bot.sendMessage(chatId, `⚠️ Ошибка запуска мониторинга: ${error.message}`);
+                });
+            }
+
+            await bot.answerCallbackQuery(query.id, {
+                text: '✅ Подписка активирована!',
+                show_alert: false
+            });
+
+        } else if (action === 'stop') {
+            // Отписка от уведомлений
+            if (!subscribedChats.has(chatId)) {
+                await bot.answerCallbackQuery(query.id, {
+                    text: '⚠️ Вы не подписаны!',
+                    show_alert: false
+                });
+                return;
+            }
+
+            subscribedChats.delete(chatId);
+
+            // Обновляем сообщение с новыми кнопками
+            await bot.editMessageText(
+                '🛑 Вы отписались от уведомлений.\nНажмите "Старт" для повторной подписки.',
+                {
+                    chat_id: chatId,
+                    message_id: messageId,
+                    reply_markup: getKeyboard(false)
+                }
+            );
+
+            await bot.answerCallbackQuery(query.id, {
+                text: '🛑 Подписка отключена',
+                show_alert: false
+            });
+
+            console.log(`Пользователь ${chatId} отписался. Активных подписок: ${subscribedChats.size}`);
+
+        } else if (action === 'status') {
+            // Показ статуса
+            const isSubscribed = subscribedChats.has(chatId);
+            const changes = resultsCache.get('changes');
+            const cacheInfo = changes ? `Событий с изменениями: ${changes.size}` : 'Нет изменений';
+            const monitoringStatus = globalCheckInterval ? '🔄 Мониторинг активен' : '⏸️ Мониторинг не запущен';
+            const trackedEvents = `Отслеживается событий: ${previousResults.size}`;
+            const totalSubscribers = `Всего подписчиков: ${subscribedChats.size}`;
+
+            const statusMessage = `📊 Статус бота:
+
+${isSubscribed ? '✅ Вы подписаны на уведомления' : '⭕️ Вы не подписаны'}
+${monitoringStatus}
+${totalSubscribers}
+${cacheInfo}
+${trackedEvents}`;
+
+            // Отправляем статус как всплывающее уведомление
+            await bot.answerCallbackQuery(query.id, {
+                text: statusMessage,
+                show_alert: true
+            });
+        }
+    } catch (error) {
+        console.error('Ошибка обработки callback:', error);
+        await bot.answerCallbackQuery(query.id, {
+            text: '⚠️ Произошла ошибка',
+            show_alert: false
+        });
     }
-
-    activeChecks.delete(chatId);
-    await bot.sendMessage(chatId, '🛑 Останавливаю проверку...');
-});
-
-bot.onText(/\/status/, async (msg) => {
-    const chatId = msg.chat.id;
-    const isActive = activeChecks.get(chatId);
-    const changes = resultsCache.get('changes');
-    const cacheInfo = changes ? `Событий с изменениями: ${changes.size}` : 'Нет изменений';
-    const checkStatus = checkingInProgress ? '🔄 Проверка в процессе' : '⏸️ Проверка не активна';
-    const trackedEvents = `Отслеживается событий: ${previousResults.size}`;
-
-    await bot.sendMessage(chatId,
-        `${isActive ? '✅ Подписка активна' : '⭕️ Подписка остановлена'}\n${checkStatus}\n${cacheInfo}\n${trackedEvents}`
-    );
 });
 
 console.log('Бот запущен...');
