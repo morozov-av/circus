@@ -182,7 +182,7 @@ async function sendCachedResults(chatId, isFirstRun = false) {
         });
 
         if (message.length > 0) {
-            await bot.sendMessage(chatId, message);
+            //await bot.sendMessage(chatId, message);
         }
     }
 }
@@ -221,7 +221,7 @@ async function runChecks(chatId) {
         isFirstRun = false;
 
         // Запускаем новую проверку
-        await bot.sendMessage(chatId, '🔍 Запускаю новую проверку...');
+        //await bot.sendMessage(chatId, '🔍 Запускаю новую проверку...');
         await performChecks();
 
         if (!activeChecks.get(chatId)) {
@@ -235,7 +235,7 @@ async function runChecks(chatId) {
             await bot.sendMessage(chatId, '🔔 Новые изменения:');
             await sendCachedResults(chatId, false);
         } else {
-            await bot.sendMessage(chatId, '✅ Проверка завершена. Изменений не обнаружено.');
+            //await bot.sendMessage(chatId, '✅ Проверка завершена. Изменений не обнаружено.');
         }
     }
 }
