@@ -1,0 +1,39 @@
+name: ticket-bot
+
+on:
+  schedule:
+    # Каждые 5 часов поднимаем бота заново: job в Actions живёт не дольше 6 часов
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ticket-bot
+  cancel-in-progress: true
+
+permissions:
+  # Нужно, чтобы бот сохранял подписки и фильтры в state/subscribers.json
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci --omit=dev
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STATE_REPO: ${{ github.repository }}
+          STATE_BRANCH: ${{ github.ref_name }}
+          # Выходим раньше таймаута job, чтобы следующий запуск стартовал без пересечения
+          RUN_MINUTES: '290'
+        run: node index.js
