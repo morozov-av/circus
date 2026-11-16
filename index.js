@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const TelegramBot = require('node-telegram-bot-api');
@@ -150,6 +151,8 @@ const STATE_REPO = process.env.STATE_REPO || '';
 const STATE_PATH = process.env.STATE_PATH || 'state/subscribers.json';
 const STATE_BRANCH = process.env.STATE_BRANCH || 'master';
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+// Состояние содержит chat id подписчиков, поэтому в репозиторий пишется зашифрованным
+const STATE_KEY = process.env.STATE_KEY || '';
 const LOCAL_STATE_FILE = path.join(__dirname, 'state', 'subscribers.json');
 
 const useRemoteState = Boolean(STATE_REPO && GITHUB_TOKEN);
@@ -160,19 +163,70 @@ function defaultFilters() {
     return { from: null, to: null, sectors: [], rowFrom: null, rowTo: null };
 }
 
+function stateKey() {
+    return crypto.createHash('sha256').update(STATE_KEY).digest();
+}
+
+function encryptState(plain) {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', stateKey(), iv);
+    const data = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
+
+    return JSON.stringify({
+        v: 1,
+        iv: iv.toString('base64'),
+        tag: cipher.getAuthTag().toString('base64'),
+        data: data.toString('base64')
+    }, null, 2);
+}
+
+function decryptState(raw) {
+    const box = JSON.parse(raw);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', stateKey(), Buffer.from(box.iv, 'base64'));
+    decipher.setAuthTag(Buffer.from(box.tag, 'base64'));
+
+    return Buffer.concat([decipher.update(Buffer.from(box.data, 'base64')), decipher.final()]).toString('utf8');
+}
+
+function isEncrypted(raw) {
+    try {
+        const box = JSON.parse(raw);
+        return Boolean(box) && box.v === 1 && typeof box.data === 'string' && typeof box.iv === 'string';
+    } catch (error) {
+        return false;
+    }
+}
+
 function serializeState() {
     const chats = [];
     for (const [chatId, entry] of subscribers) {
         chats.push({ chatId, filters: entry.filters });
     }
-    return JSON.stringify({ chats }, null, 2);
+    const plain = JSON.stringify({ chats }, null, 2);
+
+    return STATE_KEY ? encryptState(plain) : plain;
 }
 
 function applyState(raw) {
     let parsed;
+    let content = raw;
+
+    if (isEncrypted(raw)) {
+        if (!STATE_KEY) {
+            console.error('⚠️ Состояние зашифровано, но STATE_KEY не задан — начинаю с пустого');
+            return;
+        }
+
+        try {
+            content = decryptState(raw);
+        } catch (error) {
+            console.error('⚠️ Не удалось расшифровать состояние:', error.message);
+            return;
+        }
+    }
 
     try {
-        parsed = JSON.parse(raw);
+        parsed = JSON.parse(content);
     } catch (error) {
         console.error('⚠️ Состояние повреждено, начинаю с пустого:', error.message);
         return;
@@ -233,27 +287,48 @@ async function writeState() {
         return;
     }
 
+    // Ветку могли переписать или файл изменить параллельно: при отказе перечитываем sha и пробуем ещё раз
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+            const response = await axios.put(
+                `https://api.github.com/repos/${STATE_REPO}/contents/${STATE_PATH}`,
+                {
+                    message: 'chore: обновление подписок бота',
+                    content: Buffer.from(content, 'utf8').toString('base64'),
+                    branch: STATE_BRANCH,
+                    ...(remoteStateSha ? { sha: remoteStateSha } : {})
+                },
+                {
+                    headers: { Authorization: `Bearer ${GITHUB_TOKEN}`, Accept: 'application/vnd.github+json' },
+                    timeout: 20000
+                }
+            );
+            remoteStateSha = response.data.content.sha;
+            return;
+        } catch (error) {
+            if (attempt === 0) {
+                await refreshRemoteStateSha();
+                continue;
+            }
+            console.error('⚠️ Не удалось сохранить состояние в репозиторий:', error.message);
+        }
+    }
+}
+
+// Актуальный sha файла состояния: без него GitHub отклоняет перезапись
+async function refreshRemoteStateSha() {
     try {
-        const response = await axios.put(
+        const response = await axios.get(
             `https://api.github.com/repos/${STATE_REPO}/contents/${STATE_PATH}`,
             {
-                message: 'chore: обновление подписок бота',
-                content: Buffer.from(content, 'utf8').toString('base64'),
-                branch: STATE_BRANCH,
-                ...(remoteStateSha ? { sha: remoteStateSha } : {})
-            },
-            {
+                params: { ref: STATE_BRANCH },
                 headers: { Authorization: `Bearer ${GITHUB_TOKEN}`, Accept: 'application/vnd.github+json' },
                 timeout: 20000
             }
         );
-        remoteStateSha = response.data.content.sha;
+        remoteStateSha = response.data.sha;
     } catch (error) {
-        // Файл мог измениться параллельно — перечитываем sha и пробуем в следующий раз
-        if (error.response && error.response.status === 409) {
-            remoteStateSha = null;
-        }
-        console.error('⚠️ Не удалось сохранить состояние в репозиторий:', error.message);
+        remoteStateSha = null;
     }
 }
 
