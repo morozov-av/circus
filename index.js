@@ -110,6 +110,9 @@ const CYCLE_INTERVAL_MS = 60000;        // интервал запуска ци�
 const MIN_SEATS_TO_REPORT = 3;          // сеанс интересен, только если мест больше
 const MESSAGE_LIMIT = 3500;             // мягкий лимит длины сообщения Telegram
 const SEATS_IN_CAPTION = 12;            // сколько мест перечислять в уведомлении
+// Соседние места в ряду отстоят на 44–62 единицы схемы при радиусе 17.21,
+// пропущенное место даёт уже 90+, поэтому запас в 4.5 радиуса безопасен
+const ADJACENT_GAP_FACTOR = 4.5;
 
 // Уровни в атрибуте name у кружка места: "2:<сектор>/3:<ряд>/4:<место>"
 const LEVEL_SECTOR = '2';
@@ -160,7 +163,7 @@ let remoteStateSha = null;
 let saveTimer = null;
 
 function defaultFilters() {
-    return { from: null, to: null, sectors: [], rowFrom: null, rowTo: null };
+    return { from: null, to: null, sectors: [], rowFrom: null, rowTo: null, minAdjacent: null };
 }
 
 function stateKey() {
@@ -275,6 +278,11 @@ async function loadState() {
 }
 
 async function writeState() {
+    if (useRemoteState && !STATE_KEY) {
+        console.error('⚠️ STATE_KEY не задан — не записываю состояние в репозиторий, чтобы chat id не попали в открытые коммиты');
+        return;
+    }
+
     const content = serializeState();
 
     if (!useRemoteState) {
@@ -383,6 +391,7 @@ function parseSeatName(name) {
         box,
         row: Number.isFinite(row) ? row : null,
         seat: levels[LEVEL_SEAT] || null,
+        seatNumber: Number(levels[LEVEL_SEAT]),
         zone: box ? `ложа ${box}` : (sector ? `сектор ${sector}` : 'зал'),
         zoneKey: (box ? `ложа ${box}` : (sector || '')).toLowerCase()
     };
@@ -393,6 +402,75 @@ function formatSeat(info) {
     if (info.row !== null) parts.push(`ряд ${info.row}`);
     if (info.seat) parts.push(`место ${info.seat}`);
     return parts.join(', ');
+}
+
+// Непрерывные цепочки свободных мест в одном ряду: соседние номера и реальное соседство на схеме
+function seatRuns(seats) {
+    const byRow = new Map();
+
+    seats.forEach(seat => {
+        const key = `${seat.info.zoneKey}|${seat.info.row}`;
+        if (!byRow.has(key)) {
+            byRow.set(key, []);
+        }
+        byRow.get(key).push(seat);
+    });
+
+    const runs = [];
+
+    for (const rowSeats of byRow.values()) {
+        const sorted = [...rowSeats].sort((a, b) => a.info.seatNumber - b.info.seatNumber);
+        let run = [];
+
+        sorted.forEach(seat => {
+            const previous = run[run.length - 1];
+
+            if (previous && isNextTo(previous, seat)) {
+                run.push(seat);
+                return;
+            }
+
+            if (run.length > 0) {
+                runs.push(run);
+            }
+            run = [seat];
+        });
+
+        if (run.length > 0) {
+            runs.push(run);
+        }
+    }
+
+    return runs.sort((a, b) => b.length - a.length);
+}
+
+// Номера идут подряд и кружки стоят рядом: без второй проверки через проход
+// в ряду места с номерами N и N+1 считались бы соседними
+function isNextTo(first, second) {
+    if (!Number.isFinite(first.info.seatNumber) || !Number.isFinite(second.info.seatNumber)) {
+        return false;
+    }
+    if (second.info.seatNumber - first.info.seatNumber !== 1) {
+        return false;
+    }
+
+    const radius = first.r || second.r;
+
+    if (!Number.isFinite(first.cx) || !Number.isFinite(second.cx) || !radius) {
+        return true;
+    }
+
+    const distance = Math.hypot(first.cx - second.cx, first.cy - second.cy);
+
+    return distance <= radius * ADJACENT_GAP_FACTOR;
+}
+
+function describeRun(run) {
+    const first = run[0].info;
+    const last = run[run.length - 1].info;
+    const seatsText = run.length === 1 ? `место ${first.seat}` : `места ${first.seat}–${last.seat}`;
+
+    return `${first.zone}, ряд ${first.row}, ${seatsText} — ${run.length} подряд`;
 }
 
 // «сектор 1: ряды 3–10 (12)» по каждой зоне
@@ -545,8 +623,9 @@ async function checkEvent(session) {
                         name: name,
                         info: parseSeatName(name),
                         color: fill,
-                        cx: circle.getAttribute('cx'),
-                        cy: circle.getAttribute('cy'),
+                        cx: Number(circle.getAttribute('cx')),
+                        cy: Number(circle.getAttribute('cy')),
+                        r: Number(circle.getAttribute('r')),
                         priceId: group.getAttribute('price_id')
                     });
                 }
@@ -639,14 +718,20 @@ function matchingSeats(result, filters) {
         return null;
     }
 
-    const seats = result.availableSeats.filter(seat => seatMatchesFilters(seat, filters));
+    let seats = result.availableSeats.filter(seat => seatMatchesFilters(seat, filters));
+
+    if (filters.minAdjacent) {
+        seats = seatRuns(seats)
+            .filter(run => run.length >= filters.minAdjacent)
+            .flat();
+    }
 
     return seats.length > 0 ? seats : null;
 }
 
 function hasFilters(filters) {
     return Boolean(filters.from || filters.to || filters.sectors.length > 0
-        || filters.rowFrom !== null || filters.rowTo !== null);
+        || filters.rowFrom !== null || filters.rowTo !== null || filters.minAdjacent);
 }
 
 function describeFilters(filters) {
@@ -664,6 +749,10 @@ function describeFilters(filters) {
         const from = filters.rowFrom === null ? '1' : filters.rowFrom;
         const to = filters.rowTo === null ? '…' : filters.rowTo;
         parts.push(`ряды ${from}–${to}`);
+    }
+
+    if (filters.minAdjacent) {
+        parts.push(`мест рядом: от ${filters.minAdjacent}`);
     }
 
     return parts.length > 0 ? parts.join(' · ') : 'не заданы';
@@ -758,6 +847,23 @@ function parseRows(text) {
     return { rowFrom: Math.min(numbers[0], numbers[1]), rowTo: Math.max(numbers[0], numbers[1]) };
 }
 
+// Принимает «4», «от 4», «off»
+function parseAdjacent(text) {
+    const value = text.trim().toLowerCase();
+
+    if (['off', 'сброс', 'любое', 'все', 'всё', '-', '1'].includes(value)) {
+        return { minAdjacent: null };
+    }
+
+    const number = Number((value.match(/\d+/) || [])[0]);
+
+    if (!Number.isFinite(number) || number < 1) {
+        return null;
+    }
+
+    return { minAdjacent: number > 1 ? number : null };
+}
+
 // ─────────────────────────── клавиатуры ───────────────────────────
 
 function getKeyboard(chatId) {
@@ -783,6 +889,7 @@ function getFiltersKeyboard(filters) {
             [{ text: `📅 Период: ${filters.from || filters.to ? describePeriodShort(filters) : 'любой'}`, callback_data: 'set_period' }],
             [{ text: `🎯 Сектора: ${filters.sectors.length > 0 ? filters.sectors.join(', ') : 'любые'}`, callback_data: 'set_sector' }],
             [{ text: `🪑 Ряды: ${filters.rowFrom !== null || filters.rowTo !== null ? `${filters.rowFrom || 1}–${filters.rowTo || '…'}` : 'любые'}`, callback_data: 'set_row' }],
+            [{ text: `👥 Мест рядом: ${filters.minAdjacent ? `от ${filters.minAdjacent}` : 'любое'}`, callback_data: 'set_adjacent' }],
             [{ text: '♻️ Сбросить фильтры', callback_data: 'reset_filters' }],
             [{ text: '⬅️ Назад', callback_data: 'menu' }]
         ]
@@ -852,8 +959,18 @@ async function sendSummary(chatId, header) {
         if (!seats) continue;
 
         totalSeats += seats.length;
-        lines.push(`🎫 ${formatSession(session)} — ${seats.length} мест`);
-        lines.push(`   ${zoneSummary(seats)}`);
+
+        if (filters.minAdjacent) {
+            const runs = seatRuns(seats);
+            lines.push(`🎫 ${formatSession(session)} — групп по ${filters.minAdjacent}+ рядом: ${runs.length}`);
+            runs.slice(0, 5).forEach(run => lines.push(`   ${describeRun(run)}`));
+            if (runs.length > 5) {
+                lines.push(`   …и ещё ${runs.length - 5}`);
+            }
+        } else {
+            lines.push(`🎫 ${formatSession(session)} — ${seats.length} мест`);
+            lines.push(`   ${zoneSummary(seats)}`);
+        }
         lines.push(`   ${buyUrl(session.id)}`);
         lines.push('');
     }
@@ -893,13 +1010,18 @@ async function notifyChange(result, changeType) {
             continue;
         }
 
-        const listed = seats
-            .slice(0, SEATS_IN_CAPTION)
-            .map(seat => formatSeat(seat.info))
-            .join('\n');
-        const more = seats.length > SEATS_IN_CAPTION ? `\n…и ещё ${seats.length - SEATS_IN_CAPTION}` : '';
+        const runs = seatRuns(seats);
+        const groupMode = Boolean(entry.filters.minAdjacent);
+        const items = groupMode ? runs.map(describeRun) : seats.map(seat => formatSeat(seat.info));
+        const shown = groupMode ? Math.min(items.length, 8) : Math.min(items.length, SEATS_IN_CAPTION);
+        const listed = items.slice(0, shown).join('\n');
+        const more = items.length > shown ? `\n…и ещё ${items.length - shown}` : '';
 
-        const caption = `${changeEmoji} ${changeText}\n🎪 ${SHOW.title}\n📅 ${formatSession(result.session)}\n🟢 Подходящих мест: ${seats.length}\n${zoneSummary(seats)}\n\n${listed}${more}\n\n🎟 ${buyUrl(result.eventId)}`;
+        const headline = groupMode
+            ? `🟢 Групп по ${entry.filters.minAdjacent}+ мест рядом: ${runs.length} (мест: ${seats.length})`
+            : `🟢 Подходящих мест: ${seats.length}\n${zoneSummary(seats)}`;
+
+        const caption = `${changeEmoji} ${changeText}\n🎪 ${SHOW.title}\n📅 ${formatSession(result.session)}\n${headline}\n\n${listed}${more}\n\n🎟 ${buyUrl(result.eventId)}`;
 
         try {
             await bot.sendPhoto(chatId, result.image, { caption: caption.slice(0, 1024) });
@@ -1017,6 +1139,7 @@ const HELP_TEXT = `🎪 Бот следит за билетами на «${SHOW.
 /period 29.12 3.01 — только этот период (/period off — сброс)
 /sector 1,2 — только эти сектора, можно «ложа 2» (/sector off — сброс)
 /row 1-3 — только эти ряды, /row 1 — первый ряд (/row off — сброс)
+/together 4 — только где минимум 4 места подряд в одном ряду (/together off — сброс)
 /help — эта справка`;
 
 function ensureEntry(chatId) {
@@ -1112,6 +1235,10 @@ bot.onText(/^\/row\b\s*(.*)$/, async (msg, match) => {
     await applyRows(msg.chat.id, match[1]);
 });
 
+bot.onText(/^\/(?:together|adjacent)\b\s*(.*)$/, async (msg, match) => {
+    await applyAdjacent(msg.chat.id, match[1]);
+});
+
 async function applyPeriod(chatId, text) {
     if (!text.trim()) {
         setAwaiting(chatId, 'period');
@@ -1181,6 +1308,30 @@ async function applyRows(chatId, text) {
     });
 }
 
+async function applyAdjacent(chatId, text) {
+    if (!text.trim()) {
+        setAwaiting(chatId, 'adjacent');
+        await bot.sendMessage(chatId, '👥 Сколько мест должно быть подряд в одном ряду? Например «4». «off» — снять фильтр.');
+        return;
+    }
+
+    const parsed = parseAdjacent(text);
+
+    if (!parsed) {
+        await bot.sendMessage(chatId, '⚠️ Не понял количество. Примеры: 4, от 4, off');
+        return;
+    }
+
+    const filters = filtersOf(chatId);
+    filters.minAdjacent = parsed.minAdjacent;
+    setAwaiting(chatId, null);
+    saveState();
+
+    await bot.sendMessage(chatId, `✅ Фильтры: ${describeFilters(filters)}`, {
+        reply_markup: getFiltersKeyboard(filters)
+    });
+}
+
 // Свободный ввод после нажатия кнопки фильтра
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
@@ -1200,6 +1351,7 @@ bot.on('message', async (msg) => {
         if (awaiting === 'period') await applyPeriod(chatId, text);
         else if (awaiting === 'sector') await applySectors(chatId, text);
         else if (awaiting === 'row') await applyRows(chatId, text);
+        else if (awaiting === 'adjacent') await applyAdjacent(chatId, text);
     } catch (error) {
         console.error('Ошибка обработки ввода:', error.message);
     }
@@ -1302,6 +1454,11 @@ ${globalCheckInterval ? '🔄 Мониторинг активен' : '⏸️ М�
             setAwaiting(chatId, 'row');
             await bot.answerCallbackQuery(query.id);
             await bot.sendMessage(chatId, '🪑 Пришлите ряды: «1» — первый ряд, «1-3», «до 5». «off» — снять фильтр.');
+
+        } else if (action === 'set_adjacent') {
+            setAwaiting(chatId, 'adjacent');
+            await bot.answerCallbackQuery(query.id);
+            await bot.sendMessage(chatId, '👥 Сколько мест подряд нужно в одном ряду? Пришлите число, например «4». «off» — снять фильтр.');
 
         } else if (action.startsWith('zone:')) {
             const key = action.slice(5);
