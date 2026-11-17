@@ -106,7 +106,8 @@ const FALLBACK_SESSIONS = [
 const WIDGET_ID = 9;
 const SCHEDULE_TTL_MS = 30 * 60 * 1000; // как часто перечитывать расписание с сайта
 const CHECK_DELAY_MS = 2000;            // пауза между запросами схем залов
-const CYCLE_INTERVAL_MS = 60000;        // интервал запуска цикла проверки
+const CYCLE_INTERVAL_MS = 300000;       // интервал запуска цикла проверки: круг по всем сеансам идёт ~6 минут
+const NOTIFY_COOLDOWN_MS = 15 * 60 * 1000; // не чаще одного уведомления по сеансу на чат
 const MIN_SEATS_TO_REPORT = 3;          // сеанс интересен, только если мест больше
 const MESSAGE_LIMIT = 3500;             // мягкий лимит длины сообщения Telegram
 const SEATS_IN_CAPTION = 12;            // сколько мест перечислять в уведомлении
@@ -124,6 +125,8 @@ const LEVEL_SEAT = '4';
 const subscribers = new Map();
 // Текущая картина по сеансам: id -> result
 const currentResults = new Map();
+// Что уже отправляли: `${chatId}:${eventId}` -> { ids: Set, at: timestamp }
+const lastNotified = new Map();
 // Актуальный список сеансов шоу
 let sessions = [];
 let sessionsFetchedAt = 0;
@@ -584,6 +587,7 @@ async function refreshSessions(force = false) {
     for (const eventId of [...currentResults.keys()]) {
         if (!actualIds.has(eventId)) {
             currentResults.delete(eventId);
+            forgetNotified(eventId);
         }
     }
 
@@ -666,25 +670,44 @@ function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function compareResults(newResult, oldResult) {
-    if (!oldResult) {
-        return { hasChanges: true, type: 'new' };
+// Нас интересует только появление мест: исчезновение значит, что их кто-то купил
+function diffSeats(newResult, oldResult) {
+    const oldIds = new Set(oldResult ? oldResult.availableSeats.map(seat => seat.id) : []);
+    const newIds = new Set(newResult.availableSeats.map(seat => seat.id));
+
+    return {
+        added: newResult.availableSeats.filter(seat => !oldIds.has(seat.id)),
+        removed: oldResult ? oldResult.availableSeats.filter(seat => !newIds.has(seat.id)).length : 0
+    };
+}
+
+function notifyKey(chatId, eventId) {
+    return `${chatId}:${eventId}`;
+}
+
+// Запоминаем текущую подборку как отправленную, чтобы сводка не повторилась уведомлениями
+function primeNotified(chatId) {
+    const entry = subscribers.get(chatId);
+
+    if (!entry) {
+        return;
     }
 
-    const newSeatIds = new Set(newResult.availableSeats.map(s => s.id));
-    const oldSeatIds = new Set(oldResult.availableSeats.map(s => s.id));
-
-    if (newSeatIds.size !== oldSeatIds.size) {
-        return { hasChanges: true, type: 'count_changed' };
+    for (const [eventId, result] of currentResults) {
+        const seats = matchingSeats(result, entry.filters);
+        lastNotified.set(notifyKey(chatId, eventId), {
+            ids: new Set((seats || []).map(seat => seat.id)),
+            at: Date.now()
+        });
     }
+}
 
-    for (const id of newSeatIds) {
-        if (!oldSeatIds.has(id)) {
-            return { hasChanges: true, type: 'seats_changed' };
+function forgetNotified(eventId) {
+    for (const key of [...lastNotified.keys()]) {
+        if (key.endsWith(`:${eventId}`)) {
+            lastNotified.delete(key);
         }
     }
-
-    return { hasChanges: false, type: 'same' };
 }
 
 // ─────────────────────────── фильтры ───────────────────────────
@@ -990,41 +1013,46 @@ async function sendSummary(chatId, header) {
     await sendChunks(chatId, lines, title);
 }
 
-// Точечное уведомление об изменении на одном сеансе
-async function notifyChange(result, changeType) {
-    let changeEmoji = '🆕';
-    let changeText = 'Новые билеты';
-
-    if (changeType === 'count_changed') {
-        changeEmoji = '🔄';
-        changeText = 'Изменилось количество мест';
-    } else if (changeType === 'seats_changed') {
-        changeEmoji = '🔄';
-        changeText = 'Изменились места';
-    }
-
+// Точечное уведомление: шлём, только если у чата появились новые подходящие места
+async function notifyChange(result) {
     for (const [chatId, entry] of subscribers) {
-        const seats = matchingSeats(result, entry.filters);
+        const seats = matchingSeats(result, entry.filters) || [];
+        const key = notifyKey(chatId, result.eventId);
+        const previous = lastNotified.get(key);
+        const knownIds = previous ? previous.ids : new Set();
+        const gained = seats.filter(seat => !knownIds.has(seat.id));
 
-        if (!seats) {
+        if (gained.length === 0) {
+            // Места только убавились — для покупателя это не новость
+            if (previous) {
+                previous.ids = new Set(seats.map(seat => seat.id));
+            }
             continue;
         }
 
-        const runs = seatRuns(seats);
+        // Кулдаун: не обновляем память, чтобы эти места ушли следующим уведомлением
+        if (previous && Date.now() - previous.at < NOTIFY_COOLDOWN_MS) {
+            continue;
+        }
+
         const groupMode = Boolean(entry.filters.minAdjacent);
-        const items = groupMode ? runs.map(describeRun) : seats.map(seat => formatSeat(seat.info));
-        const shown = groupMode ? Math.min(items.length, 8) : Math.min(items.length, SEATS_IN_CAPTION);
-        const listed = items.slice(0, shown).join('\n');
-        const more = items.length > shown ? `\n…и ещё ${items.length - shown}` : '';
+        const gainedIds = new Set(gained.map(seat => seat.id));
+        const freshRuns = seatRuns(seats).filter(run => run.some(seat => gainedIds.has(seat.id)));
+        const items = groupMode ? freshRuns.map(describeRun) : gained.map(seat => formatSeat(seat.info));
+        const limit = groupMode ? 8 : SEATS_IN_CAPTION;
+        const listed = items.slice(0, limit).join('\n');
+        const more = items.length > limit ? `\n…и ещё ${items.length - limit}` : '';
 
         const headline = groupMode
-            ? `🟢 Групп по ${entry.filters.minAdjacent}+ мест рядом: ${runs.length} (мест: ${seats.length})`
-            : `🟢 Подходящих мест: ${seats.length}\n${zoneSummary(seats)}`;
+            ? `🟢 Новые группы по ${entry.filters.minAdjacent}+ мест рядом: ${freshRuns.length}\nВсего подходит мест: ${seats.length}`
+            : `🟢 Новых мест: ${gained.length}\nВсего подходит: ${seats.length} · ${zoneSummary(seats)}`;
 
-        const caption = `${changeEmoji} ${changeText}\n🎪 ${SHOW.title}\n📅 ${formatSession(result.session)}\n${headline}\n\n${listed}${more}\n\n🎟 ${buyUrl(result.eventId)}`;
+        const title = previous ? '➕ Появились новые места' : '🆕 Появились билеты';
+        const caption = `${title}\n🎪 ${SHOW.title}\n📅 ${formatSession(result.session)}\n${headline}\n\n${listed}${more}\n\n🎟 ${buyUrl(result.eventId)}`;
 
         try {
             await bot.sendPhoto(chatId, result.image, { caption: caption.slice(0, 1024) });
+            lastNotified.set(key, { ids: new Set(seats.map(seat => seat.id)), at: Date.now() });
         } catch (error) {
             console.error(`Ошибка отправки в чат ${chatId}:`, error.message);
         }
@@ -1056,21 +1084,23 @@ async function performChecks() {
             const result = await checkEvent(session);
 
             if (result) {
-                const comparison = compareResults(result, currentResults.get(session.id));
+                const diff = diffSeats(result, currentResults.get(session.id));
                 currentResults.set(session.id, result);
 
-                if (comparison.hasChanges) {
+                if (diff.added.length > 0 || diff.removed > 0) {
                     changes += 1;
-                    console.log(`✅ ${formatSession(session)} (${session.id}): ${comparison.type}, мест ${result.availableSeats.length}`);
+                    console.log(`✅ ${formatSession(session)} (${session.id}): +${diff.added.length} / -${diff.removed}, всего ${result.availableSeats.length}`);
+                }
 
-                    // Первый цикл после старта отдаём сводкой, дальше — по одному изменению
-                    if (firstCycleDone) {
-                        await notifyChange(result, comparison.type);
-                    }
+                // Первый цикл после старта отдаём сводкой, дальше — точечными уведомлениями.
+                // Вызываем каждый круг: уведомление могло быть отложено кулдауном
+                if (firstCycleDone) {
+                    await notifyChange(result);
                 }
             } else if (currentResults.has(session.id)) {
                 console.log(`❌ ${formatSession(session)} (${session.id}): места закончились`);
                 currentResults.delete(session.id);
+                forgetNotified(session.id);
             }
 
             await delay(CHECK_DELAY_MS);
@@ -1084,6 +1114,7 @@ async function performChecks() {
             for (const chatId of subscribers.keys()) {
                 try {
                     await sendSummary(chatId, '📦 Текущая картина по билетам:');
+                    primeNotified(chatId);
                 } catch (error) {
                     console.error(`Ошибка отправки сводки в чат ${chatId}:`, error.message);
                 }
@@ -1258,6 +1289,7 @@ async function applyPeriod(chatId, text) {
     filters.to = period.to;
     setAwaiting(chatId, null);
     saveState();
+    primeNotified(chatId);
 
     await bot.sendMessage(chatId, `✅ Фильтры: ${describeFilters(filters)}`, {
         reply_markup: getFiltersKeyboard(filters)
@@ -1277,6 +1309,7 @@ async function applySectors(chatId, text) {
     filters.sectors = parseSectors(text);
     setAwaiting(chatId, null);
     saveState();
+    primeNotified(chatId);
 
     await bot.sendMessage(chatId, `✅ Фильтры: ${describeFilters(filters)}`, {
         reply_markup: getFiltersKeyboard(filters)
@@ -1302,6 +1335,7 @@ async function applyRows(chatId, text) {
     filters.rowTo = rows.rowTo;
     setAwaiting(chatId, null);
     saveState();
+    primeNotified(chatId);
 
     await bot.sendMessage(chatId, `✅ Фильтры: ${describeFilters(filters)}`, {
         reply_markup: getFiltersKeyboard(filters)
@@ -1326,6 +1360,7 @@ async function applyAdjacent(chatId, text) {
     filters.minAdjacent = parsed.minAdjacent;
     setAwaiting(chatId, null);
     saveState();
+    primeNotified(chatId);
 
     await bot.sendMessage(chatId, `✅ Фильтры: ${describeFilters(filters)}`, {
         reply_markup: getFiltersKeyboard(filters)
@@ -1376,6 +1411,7 @@ bot.on('callback_query', async (query) => {
             if (added) {
                 if (currentResults.size > 0) {
                     await sendSummary(chatId, '📦 Текущая картина по билетам:');
+                    primeNotified(chatId);
                 } else {
                     await bot.sendMessage(chatId, '🔄 Собираю данные, первая сводка придёт через несколько минут.');
                 }
@@ -1472,6 +1508,7 @@ ${globalCheckInterval ? '🔄 Мониторинг активен' : '⏸️ М�
 
             setAwaiting(chatId, null);
             saveState();
+            primeNotified(chatId);
 
             await bot.editMessageReplyMarkup(getSectorsKeyboard(filters), { chat_id: chatId, message_id: messageId });
             await bot.answerCallbackQuery(query.id, { text: `Сектора: ${filters.sectors.length > 0 ? filters.sectors.join(', ') : 'любые'}` });
@@ -1480,6 +1517,7 @@ ${globalCheckInterval ? '🔄 Мониторинг активен' : '⏸️ М�
             const filters = filtersOf(chatId);
             filters.sectors = [];
             saveState();
+            primeNotified(chatId);
 
             await bot.editMessageReplyMarkup(getSectorsKeyboard(filters), { chat_id: chatId, message_id: messageId });
             await bot.answerCallbackQuery(query.id, { text: 'Сектора: любые' });
@@ -1489,6 +1527,7 @@ ${globalCheckInterval ? '🔄 Мониторинг активен' : '⏸️ М�
             Object.assign(filters, defaultFilters());
             setAwaiting(chatId, null);
             saveState();
+            primeNotified(chatId);
 
             await bot.editMessageText('♻️ Фильтры сброшены.', {
                 chat_id: chatId,
