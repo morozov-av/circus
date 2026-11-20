@@ -121,6 +121,10 @@ const SCHEDULE_TTL_MS = 30 * 60 * 1000; // как часто перечитыв�
 const CHECK_DELAY_MS = 2000;            // пауза между запросами схем залов
 const CYCLE_INTERVAL_MS = 300000;       // интервал запуска цикла проверки: круг по всем сеансам идёт ~6 минут
 const NOTIFY_COOLDOWN_MS = 15 * 60 * 1000; // не чаще одного уведомления по сеансу на чат
+const ALERT_COOLDOWN_MS = 60 * 60 * 1000;  // как часто повторять один и тот же алерт
+const CYCLE_FAIL_SHARE = 0.2;              // доля непроверенных сеансов за круг, после которой шлём алерт
+// Кому писать о проблемах. Если не задан — всем подписчикам
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '';
 const MIN_SEATS_TO_REPORT = 3;          // сеанс интересен, только если мест больше
 const MESSAGE_LIMIT = 3500;             // мягкий лимит длины сообщения Telegram
 const SEATS_IN_CAPTION = 12;            // сколько мест перечислять в уведомлении
@@ -138,6 +142,22 @@ const LEVEL_SEAT = '4';
 const subscribers = new Map();
 // Текущая картина по сеансам: id -> result
 const currentResults = new Map();
+// Самодиагностика: что показывать в /health и по чему бить алерты
+const health = {
+    startedAt: Date.now(),
+    scheduleSource: null,
+    scheduleAt: null,
+    scheduleError: null,
+    cycles: 0,
+    lastCycleAt: null,
+    lastCycleMs: null,
+    lastCycleFailed: 0,
+    lastCycleChecked: 0,
+    notificationsSent: 0
+};
+// Активные алерты: вид -> время последней отправки
+const activeAlerts = new Map();
+
 // Что уже отправляли: `${chatId}:${eventId}` -> { ids: Set, at: timestamp }
 const lastNotified = new Map();
 // Актуальный список сеансов шоу
@@ -366,6 +386,91 @@ function saveState() {
         saveTimer = null;
         writeState().catch(error => console.error('⚠️ Ошибка сохранения состояния:', error.message));
     }, 5000);
+}
+
+// ─────────────────────────── самодиагностика ───────────────────────────
+
+function alertRecipients() {
+    if (ADMIN_CHAT_ID) {
+        return [Number(ADMIN_CHAT_ID)];
+    }
+    return [...subscribers.keys()];
+}
+
+async function sendAlert(text) {
+    for (const chatId of alertRecipients()) {
+        try {
+            await bot.sendMessage(chatId, text, { disable_web_page_preview: true });
+        } catch (error) {
+            console.error(`Не удалось отправить алерт в чат ${chatId}:`, error.message);
+        }
+    }
+}
+
+// Пишем только при смене состояния, повтор — не чаще раза в час
+async function raiseAlert(kind, text) {
+    const last = activeAlerts.get(kind);
+
+    if (last && Date.now() - last < ALERT_COOLDOWN_MS) {
+        return;
+    }
+
+    activeAlerts.set(kind, Date.now());
+    console.log(`🚨 Алерт [${kind}]: ${text.replace(/\n/g, ' ')}`);
+    await sendAlert(`🚨 ${text}`);
+}
+
+async function resolveAlert(kind, text) {
+    if (!activeAlerts.has(kind)) {
+        return;
+    }
+
+    activeAlerts.delete(kind);
+    console.log(`✅ Алерт снят [${kind}]`);
+    await sendAlert(`✅ ${text}`);
+}
+
+function uptimeText() {
+    const minutes = Math.floor((Date.now() - health.startedAt) / 60000);
+    const hours = Math.floor(minutes / 60);
+
+    return hours > 0 ? `${hours} ч ${minutes % 60} мин` : `${minutes} мин`;
+}
+
+function agoText(timestamp) {
+    if (!timestamp) {
+        return 'ещё не было';
+    }
+
+    const minutes = Math.floor((Date.now() - timestamp) / 60000);
+
+    return minutes < 1 ? 'только что' : `${minutes} мин назад`;
+}
+
+const SOURCE_NAMES = {
+    page: '✅ страница шоу',
+    probe: '⚠️ перебор по REST (страница недоступна)',
+    fallback: '🚨 зашитый список (оба источника недоступны)'
+};
+
+function healthReport() {
+    const failShare = health.lastCycleChecked > 0
+        ? Math.round((health.lastCycleFailed / health.lastCycleChecked) * 100)
+        : 0;
+
+    return `🩺 Диагностика
+
+⏱ Процесс живёт: ${uptimeText()}
+🔁 Кругов проверки: ${health.cycles}
+📅 Источник расписания: ${SOURCE_NAMES[health.scheduleSource] || 'ещё не обновлялось'}
+   обновлено ${agoText(health.scheduleAt)}${health.scheduleError ? `\n   последняя ошибка: ${health.scheduleError}` : ''}
+🎪 Сеансов в расписании: ${sessions.length}
+🎟 Сеансов с местами: ${currentResults.size}
+🚫 Снято с продажи: ${deadSessions.size > 0 ? [...deadSessions].join(', ') : 'нет'}
+🔎 Последний круг: ${agoText(health.lastCycleAt)}, ${health.lastCycleMs ? Math.round(health.lastCycleMs / 1000) + ' с' : '—'}
+   не проверено сеансов: ${health.lastCycleFailed} из ${health.lastCycleChecked} (${failShare}%)
+📨 Уведомлений отправлено: ${health.notificationsSent}
+${activeAlerts.size > 0 ? '🚨 Активные проблемы: ' + [...activeAlerts.keys()].join(', ') : '✅ Активных проблем нет'}`;
 }
 
 // ─────────────────────────── расписание и места ───────────────────────────
@@ -679,24 +784,35 @@ async function refreshSessions(force = false) {
     }
 
     let list = null;
+    let source = null;
+    let failure = null;
 
     try {
         list = await fetchScheduleFromSite();
+        source = 'page';
         console.log(`📅 Расписание со страницы шоу: ${list.length} сеансов`);
     } catch (error) {
+        failure = error.message;
         console.error('⚠️ Страница шоу не отдала расписание:', error.message);
     }
 
     if (!list) {
         try {
             list = await fetchScheduleByProbe();
+            source = 'probe';
             console.log(`📅 Расписание перебором по REST: ${list.length} сеансов`);
         } catch (error) {
+            failure = `${failure}; перебор: ${error.message}`;
             console.error('⚠️ Перебор по REST не помог:', error.message);
             list = FALLBACK_SESSIONS.map(session => ({ ...session, onSale: true }));
+            source = 'fallback';
             console.log(`📅 Использую зашитое расписание: ${list.length} сеансов`);
         }
     }
+
+    health.scheduleSource = source;
+    health.scheduleAt = Date.now();
+    health.scheduleError = failure;
 
     const now = Date.now();
 
@@ -718,6 +834,18 @@ async function refreshSessions(force = false) {
     }
 
     console.log(`🎪 ${SHOW.title}: предстоящих сеансов — ${sessions.length}`);
+
+    if (source === 'page') {
+        await resolveAlert('schedule', `Расписание снова читается со страницы шоу: ${sessions.length} сеансов.`);
+    } else if (source === 'probe') {
+        await raiseAlert('schedule', `Страница шоу не отдаёт расписание, работаю перебором по REST.
+Сеансов нашлось: ${sessions.length}.
+Причина: ${failure}`);
+    } else {
+        await raiseAlert('schedule', `Расписание недоступно из обоих источников, работаю по зашитому списку — он может быть устаревшим.
+Сеансов в списке: ${sessions.length}.
+Причина: ${failure}`);
+    }
 
     return sessions;
 }
@@ -1183,6 +1311,7 @@ async function notifyChange(result) {
         try {
             await bot.sendPhoto(chatId, result.image, { caption: caption.slice(0, 1024) });
             lastNotified.set(key, { ids: new Set(seats.map(seat => seat.id)), at: Date.now() });
+            health.notificationsSent += 1;
             console.log(`📨 Уведомление в чат ${chatId}: сеанс ${result.eventId}, новых мест ${gained.length}`);
         } catch (error) {
             console.error(`Ошибка отправки в чат ${chatId}:`, error.message);
@@ -1199,6 +1328,7 @@ async function performChecks() {
     }
 
     isCheckRunning = true;
+    const cycleStartedAt = Date.now();
     console.log('🔄 Начинаю новый цикл проверки...');
 
     try {
@@ -1266,6 +1396,22 @@ async function performChecks() {
             console.log(`⚠️ Не удалось проверить сеансов: ${failed.length} (${failed.slice(0, 5).join(', ')}${failed.length > 5 ? '…' : ''})`);
         }
 
+        health.cycles += 1;
+        health.lastCycleAt = Date.now();
+        health.lastCycleMs = Date.now() - cycleStartedAt;
+        health.lastCycleChecked = sessions.length;
+        health.lastCycleFailed = failed.length;
+
+        const failShare = sessions.length > 0 ? failed.length / sessions.length : 0;
+
+        if (failShare > CYCLE_FAIL_SHARE) {
+            await raiseAlert('cycle_errors', `Схемы залов не отвечают: не проверено ${failed.length} сеансов из ${sessions.length} (${Math.round(failShare * 100)}%).
+Проблемные id: ${failed.slice(0, 8).join(', ')}${failed.length > 8 ? '…' : ''}
+Пока сбой держится, я не считаю исчезнувшие места распроданными.`);
+        } else {
+            await resolveAlert('cycle_errors', `Схемы залов снова отвечают: не проверено ${failed.length} из ${sessions.length}.`);
+        }
+
         console.log(`✅ Цикл завершён. Изменений: ${changes}`);
 
         if (!firstCycleDone) {
@@ -1331,6 +1477,7 @@ const HELP_TEXT = `🎪 Бот следит за билетами на «${SHOW.
 /sector 1,2 — только эти сектора, можно «ложа 2» (/sector off — сброс)
 /row 1-3 — только эти ряды, /row 1 — первый ряд (/row off — сброс)
 /together 4 — только где минимум 4 места подряд в одном ряду (/together off — сброс)
+/health — состояние бота и источников данных
 /help — эта справка`;
 
 function ensureEntry(chatId) {
@@ -1405,6 +1552,10 @@ bot.onText(/^\/stop\b/, async (msg) => {
 
 bot.onText(/^\/list\b/, async (msg) => {
     await sendSummary(msg.chat.id, '📋 Свободные места сейчас:');
+});
+
+bot.onText(/^\/health\b/, async (msg) => {
+    await bot.sendMessage(msg.chat.id, healthReport(), { disable_web_page_preview: true });
 });
 
 bot.onText(/^\/filters\b/, async (msg) => {

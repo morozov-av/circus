@@ -36,6 +36,8 @@ jobs:
           STATE_BRANCH: ${{ github.ref_name }}
           # Файл состояния хранит chat id подписчиков, поэтому шифруется перед записью
           STATE_KEY: ${{ secrets.STATE_KEY }}
+          # Кому писать о проблемах с источниками данных
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
           # Выходим раньше таймаута job, чтобы следующий запуск стартовал без пересечения
           RUN_MINUTES: '290'
         run: node index.js
