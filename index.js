@@ -157,6 +157,8 @@ const health = {
     lastCycleChecked: 0,
     notificationsSent: 0
 };
+// Подписались, когда данных ещё не было: им сводку обещали, её надо отдать
+const pendingFirstSummary = new Set();
 // Активные алерты: вид -> время последней отправки
 const activeAlerts = new Map();
 
@@ -466,6 +468,10 @@ function startupReport(restoredChats) {
     }
 
     lines.push(`💾 Подписок восстановлено: ${restoredChats}`);
+
+    if (restoredChats > 0) {
+        lines.push('📋 Сводку после рестарта не присылаю, текущие места — /list');
+    }
 
     if (deadSessions.size > 0) {
         lines.push(`🚫 Снято с продажи: ${[...deadSessions].join(', ')}`);
@@ -993,7 +999,8 @@ function primeNotified(chatId) {
         const seats = matchingSeats(result, entry.filters);
         lastNotified.set(notifyKey(chatId, eventId), {
             ids: new Set((seats || []).map(seat => seat.id)),
-            at: Date.now()
+            // at: 0 — чтобы кулдаун не глушил первое уведомление после рестарта
+            at: 0
         });
     }
 }
@@ -1455,13 +1462,37 @@ async function performChecks() {
         if (!firstCycleDone) {
             firstCycleDone = true;
 
+            // После рестарта картина та же, что подписчик уже видел, поэтому молча
+            // помечаем её показанной: дальше придут только появления новых мест
+            let primed = 0;
+
             for (const chatId of subscribers.keys()) {
-                try {
-                    await sendSummary(chatId, '📦 Текущая картина по билетам:');
+                if (!pendingFirstSummary.has(chatId)) {
                     primeNotified(chatId);
-                } catch (error) {
-                    console.error(`Ошибка отправки сводки в чат ${chatId}:`, error.message);
+                    primed += 1;
                 }
+            }
+
+            console.log(`🔇 Первый круг: подборки помечены показанными для ${primed} чатов`);
+        }
+
+        // А тем, кто подписался до появления данных, обещанную сводку всё же отдаём
+        for (const chatId of [...pendingFirstSummary]) {
+            if (!subscribers.has(chatId)) {
+                pendingFirstSummary.delete(chatId);
+                continue;
+            }
+
+            if (currentResults.size === 0) {
+                continue;
+            }
+
+            try {
+                await sendSummary(chatId, '📦 Текущая картина по билетам:');
+                primeNotified(chatId);
+                pendingFirstSummary.delete(chatId);
+            } catch (error) {
+                console.error(`Ошибка отправки сводки в чат ${chatId}:`, error.message);
             }
         }
     } finally {
@@ -1762,6 +1793,7 @@ bot.on('callback_query', async (query) => {
                     await sendSummary(chatId, '📦 Текущая картина по билетам:');
                     primeNotified(chatId);
                 } else {
+                    pendingFirstSummary.add(chatId);
                     await bot.sendMessage(chatId, '🔄 Собираю данные, первая сводка придёт через несколько минут.');
                 }
 
