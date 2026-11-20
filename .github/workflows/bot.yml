@@ -38,6 +38,10 @@ jobs:
           STATE_KEY: ${{ secrets.STATE_KEY }}
           # Кому писать о проблемах с источниками данных
           ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+          # Чтобы в сообщении о старте была ссылка на логи и версия кода
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          GITHUB_SHA: ${{ github.sha }}
           # Выходим раньше таймаута job, чтобы следующий запуск стартовал без пересечения
           RUN_MINUTES: '290'
         run: node index.js

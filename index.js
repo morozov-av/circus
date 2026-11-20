@@ -125,6 +125,8 @@ const ALERT_COOLDOWN_MS = 60 * 60 * 1000;  // как часто повторят
 const CYCLE_FAIL_SHARE = 0.2;              // доля непроверенных сеансов за круг, после которой шлём алерт
 // Кому писать о проблемах. Если не задан — всем подписчикам
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '';
+// На GitHub Actions job живёт не дольше лимита — выходим сами, следующий запуск поднимет бота заново
+const runMinutes = Number(process.env.RUN_MINUTES || 0);
 const MIN_SEATS_TO_REPORT = 3;          // сеанс интересен, только если мест больше
 const MESSAGE_LIMIT = 3500;             // мягкий лимит длины сообщения Telegram
 const SEATS_IN_CAPTION = 12;            // сколько мест перечислять в уведомлении
@@ -452,6 +454,42 @@ const SOURCE_NAMES = {
     probe: '⚠️ перебор по REST (страница недоступна)',
     fallback: '🚨 зашитый список (оба источника недоступны)'
 };
+
+// В Actions процесс живёт ограниченное время, поэтому рестарты — штатное событие
+function startupReport(restoredChats) {
+    const lines = ['🔄 Бот запущен'];
+
+    lines.push(`📅 Расписание: ${SOURCE_NAMES[health.scheduleSource] || 'не загружено'}, сеансов ${sessions.length}`);
+
+    if (health.scheduleError) {
+        lines.push(`   ошибка источника: ${health.scheduleError}`);
+    }
+
+    lines.push(`💾 Подписок восстановлено: ${restoredChats}`);
+
+    if (deadSessions.size > 0) {
+        lines.push(`🚫 Снято с продажи: ${[...deadSessions].join(', ')}`);
+    }
+
+    const runNumber = process.env.GITHUB_RUN_NUMBER;
+    const sha = process.env.GITHUB_SHA;
+
+    if (runNumber || sha) {
+        lines.push(`🏷 Прогон ${runNumber || '—'}, код ${sha ? sha.slice(0, 7) : '—'}`);
+    }
+
+    if (runMinutes > 0) {
+        lines.push(`⏳ Плановый рестарт через ${runMinutes} мин`);
+    }
+
+    const runId = process.env.GITHUB_RUN_ID;
+
+    if (runId && STATE_REPO) {
+        lines.push(`🔗 https://github.com/${STATE_REPO}/actions/runs/${runId}`);
+    }
+
+    return lines.join('\n');
+}
 
 function healthReport() {
     const failShare = health.lastCycleChecked > 0
@@ -1855,9 +1893,6 @@ ${globalCheckInterval ? '🔄 Мониторинг активен' : '⏸️ М�
 
 // ─────────────────────────── старт ───────────────────────────
 
-// На GitHub Actions job живёт не дольше лимита — выходим сами, следующий запуск поднимет бота заново
-const runMinutes = Number(process.env.RUN_MINUTES || 0);
-
 if (runMinutes > 0) {
     setTimeout(() => {
         console.log(`⏱ Отработано ${runMinutes} минут, завершаю процесс`);
@@ -1867,11 +1902,20 @@ if (runMinutes > 0) {
 
 (async () => {
     await loadState();
+    const restoredChats = subscribers.size;
+
     await refreshSessions(true).catch(error => console.error('Не удалось загрузить расписание:', error.message));
+    await sendAlert(startupReport(restoredChats)).catch(error => console.error('Не удалось сообщить о старте:', error.message));
 
     if (subscribers.size > 0) {
         await startGlobalChecks();
     }
 })().catch(error => console.error('Ошибка запуска:', error.message));
+
+// Actions гасит процесс при отмене прогона: пишем это в лог, чтобы отличать от падения
+process.on('SIGTERM', () => {
+    console.log('⏹ Получен SIGTERM, завершаюсь');
+    process.exit(0);
+});
 
 console.log(`Бот запущен. Следим за «${SHOW.title}»...`);
