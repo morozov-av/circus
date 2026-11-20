@@ -19,10 +19,23 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const SHOW = {
     title: 'Новогодняя акватория',
     pageUrl: 'https://ticketpro.by/ru/event/bilety-na-novogodnyaya-akvatoriya',
-    // uuid группы событий и id серверного экшена getGroupEventsApi на ticketpro.by
+    // Внешний id группы сеансов: по нему REST API отдаёт её uuid
+    groupExternalId: 50809,
+    // Стартовые значения: оба переопределяются автоматически, если сайт их поменял
     groupId: 'da8a6f20-c8a5-32da-a260-e5383d306054',
-    scheduleActionId: '609a011be9bf4fd71b128b95e24df58183c362b768'
+    scheduleActionId: '60827b0d279f8c0d35d79e759a087eea26bdef5e59',
+    // Публичный REST виджета — он переживает редизайны сайта
+    widgetApi: 'https://api.ticketpro.by/ticketpro/widget/api/v1',
+    // Окно для перебора id сеансов, когда расписание со страницы недоступно
+    probeFrom: 50810,
+    probeTo: 50900
 };
+
+// Оба идентификатора живут только в памяти: сайт меняет их при каждом деплое
+let scheduleActionId = SHOW.scheduleActionId;
+let groupId = SHOW.groupId;
+// Сеансы, которых больше нет в продаже: API отвечает 422, спрашивать их незачем
+const deadSessions = new Set();
 
 // Расписание на случай, если сайт недоступен или сменил формат ответа
 const FALLBACK_SESSIONS = [
@@ -503,49 +516,116 @@ function zoneSummary(seats) {
         .join('; ');
 }
 
-// Расписание отдаёт серверный экшен Next.js на странице шоу
+// uuid группы по её внешнему id: REST виджета стабилен, в отличие от разметки сайта
+async function fetchGroupId() {
+    const response = await axios.get(
+        `${SHOW.widgetApi}/events/by-external-id/${SHOW.groupExternalId}`,
+        { headers: { 'Accept-Language': 'ru' }, timeout: 20000 }
+    );
+
+    if (!response.data || !response.data.id) {
+        throw new Error('REST не вернул uuid группы');
+    }
+
+    return response.data.id;
+}
+
+// id серверного экшена меняется при каждом деплое сайта, поэтому ищем его в бандлах страницы
+async function discoverScheduleAction() {
+    const page = await axios.get(SHOW.pageUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        responseType: 'text',
+        transformResponse: [data => data],
+        timeout: 30000
+    });
+
+    const chunks = [...new Set(page.data.match(/\/_next\/static\/chunks\/[A-Za-z0-9_.-]+\.js/g) || [])];
+
+    for (const chunk of chunks) {
+        try {
+            const body = await axios.get(`https://ticketpro.by${chunk}`, {
+                responseType: 'text',
+                transformResponse: [data => data],
+                timeout: 25000
+            });
+
+            const match = body.data.match(/createServerReference\)\("([0-9a-f]{32,64})"[^)]{0,200}getGroupEventsApi/);
+
+            if (match) {
+                return match[1];
+            }
+        } catch (error) {
+            // битый чанк не повод прекращать поиск
+        }
+    }
+
+    throw new Error('не нашёл id экшена getGroupEventsApi в бандлах страницы');
+}
+
+async function requestSchedulePage(offset, limit) {
+    const response = await axios.post(
+        SHOW.pageUrl,
+        JSON.stringify([groupId, { offset, limit }]),
+        {
+            headers: {
+                'Next-Action': scheduleActionId,
+                'Content-Type': 'text/plain;charset=UTF-8',
+                'Accept': 'text/x-component',
+                'User-Agent': 'Mozilla/5.0'
+            },
+            responseType: 'text',
+            transformResponse: [data => data],
+            timeout: 30000
+        }
+    );
+
+    const marker = response.data.indexOf('1:{"events"');
+
+    if (marker === -1) {
+        throw new Error('в ответе сайта нет блока с расписанием');
+    }
+
+    return JSON.parse(response.data.slice(marker + 2).trim());
+}
+
+function toSession(event) {
+    return {
+        id: event.externalId,
+        start: event.startTime,
+        onSale: event.isOnSale !== false && !event.isSuspended
+    };
+}
+
+// Расписание со страницы шоу: дешёво (4 запроса), но зависит от внутренностей Next.js
 async function fetchScheduleFromSite() {
     const limit = 20;
     const items = [];
     let total = null;
 
     for (let offset = 0; total === null || offset < total; offset += limit) {
-        const response = await axios.post(
-            SHOW.pageUrl,
-            JSON.stringify([SHOW.groupId, { offset, limit }]),
-            {
-                headers: {
-                    'Next-Action': SHOW.scheduleActionId,
-                    'Content-Type': 'text/plain;charset=UTF-8',
-                    'Accept': 'text/x-component',
-                    'User-Agent': 'Mozilla/5.0'
-                },
-                responseType: 'text',
-                transformResponse: [data => data],
-                timeout: 30000
-            }
-        );
+        let page;
 
-        const marker = response.data.indexOf('1:{"events"');
-        if (marker === -1) {
-            throw new Error('в ответе сайта нет блока с расписанием');
+        try {
+            page = await requestSchedulePage(offset, limit);
+        } catch (error) {
+            // Сайт задеплоили — id экшена сменился, ищем новый и пробуем ещё раз
+            if (offset > 0) {
+                throw error;
+            }
+
+            console.log('🔎 Экшен расписания не ответил, ищу новый id...');
+            scheduleActionId = await discoverScheduleAction();
+            console.log(`🔑 Новый id экшена: ${scheduleActionId}`);
+            page = await requestSchedulePage(offset, limit);
         }
 
-        const page = JSON.parse(response.data.slice(marker + 2).trim());
         const events = page.events || [];
 
         if (events.length === 0) {
             break;
         }
 
-        events.forEach(event => {
-            items.push({
-                id: event.externalId,
-                start: event.startTime,
-                onSale: event.isOnSale !== false && !event.isSuspended
-            });
-        });
-
+        events.forEach(event => items.push(toSession(event)));
         total = page.pagination ? page.pagination.total : items.length;
     }
 
@@ -556,27 +636,73 @@ async function fetchScheduleFromSite() {
     return items;
 }
 
-// Обновляет список сеансов: сначала с сайта, при ошибке — из FALLBACK_SESSIONS
+// Запасной путь: перебираем id через REST виджета. Дороже, зато не зависит от вида сайта
+async function fetchScheduleByProbe() {
+    const items = [];
+
+    for (let id = SHOW.probeFrom; id <= SHOW.probeTo; id += 1) {
+        try {
+            const response = await axios.get(
+                `${SHOW.widgetApi}/events/by-external-id/${id}`,
+                { headers: { 'Accept-Language': 'ru' }, timeout: 15000 }
+            );
+            const event = response.data;
+
+            if (event && event.externalId && event.type === 'CHILD'
+                && event.status === 'PUBLISHED' && event.title === SHOW.title) {
+                items.push(toSession(event));
+            }
+        } catch (error) {
+            // 404 означает, что такого сеанса нет — это нормальный результат перебора
+        }
+    }
+
+    if (items.length === 0) {
+        throw new Error('перебор не нашёл ни одного сеанса шоу');
+    }
+
+    return items;
+}
+
+// Обновляет список сеансов: страница шоу, затем перебор по REST, затем зашитый список
 async function refreshSessions(force = false) {
     if (!force && sessions.length > 0 && Date.now() - sessionsFetchedAt < SCHEDULE_TTL_MS) {
         return sessions;
     }
 
-    let list;
+    if (groupId === SHOW.groupId) {
+        try {
+            groupId = await fetchGroupId();
+        } catch (error) {
+            console.error('⚠️ Не удалось уточнить uuid группы:', error.message);
+        }
+    }
+
+    let list = null;
 
     try {
         list = await fetchScheduleFromSite();
-        console.log(`📅 Расписание обновлено с сайта: ${list.length} сеансов`);
+        console.log(`📅 Расписание со страницы шоу: ${list.length} сеансов`);
     } catch (error) {
-        console.error('⚠️ Не удалось получить расписание с сайта:', error.message);
-        list = FALLBACK_SESSIONS.map(session => ({ ...session, onSale: true }));
-        console.log(`📅 Использую зашитое расписание: ${list.length} сеансов`);
+        console.error('⚠️ Страница шоу не отдала расписание:', error.message);
+    }
+
+    if (!list) {
+        try {
+            list = await fetchScheduleByProbe();
+            console.log(`📅 Расписание перебором по REST: ${list.length} сеансов`);
+        } catch (error) {
+            console.error('⚠️ Перебор по REST не помог:', error.message);
+            list = FALLBACK_SESSIONS.map(session => ({ ...session, onSale: true }));
+            console.log(`📅 Использую зашитое расписание: ${list.length} сеансов`);
+        }
     }
 
     const now = Date.now();
 
     sessions = list
         .filter(session => session.onSale !== false)
+        .filter(session => !deadSessions.has(session.id))
         .filter(session => sessionDate(session).getTime() > now)
         .sort((a, b) => sessionDate(a) - sessionDate(b));
 
@@ -636,7 +762,11 @@ async function checkEvent(session) {
             });
         });
 
-        if (availableSeats.length > MIN_SEATS_TO_REPORT) {
+        if (availableSeats.length <= MIN_SEATS_TO_REPORT) {
+            return { status: 'few' };
+        }
+
+        {
             const width = 800;
             const height = 800;
 
@@ -652,17 +782,17 @@ async function checkEvent(session) {
                 .toBuffer();
 
             return {
-                eventId,
-                session,
-                availableSeats,
-                image: pngBuffer
+                status: 'ok',
+                result: { eventId, session, availableSeats, image: pngBuffer }
             };
         }
-
-        return null;
     } catch (error) {
-        console.error(`Ошибка при проверке события ${eventId}:`, error.message);
-        return null;
+        // 422 — сеанс снят с продажи: больше его не опрашиваем до обновления расписания
+        if (error.response && error.response.status === 422) {
+            return { status: 'gone' };
+        }
+
+        return { status: 'error', message: error.message };
     }
 }
 
@@ -1053,6 +1183,7 @@ async function notifyChange(result) {
         try {
             await bot.sendPhoto(chatId, result.image, { caption: caption.slice(0, 1024) });
             lastNotified.set(key, { ids: new Set(seats.map(seat => seat.id)), at: Date.now() });
+            console.log(`📨 Уведомление в чат ${chatId}: сеанс ${result.eventId}, новых мест ${gained.length}`);
         } catch (error) {
             console.error(`Ошибка отправки в чат ${chatId}:`, error.message);
         }
@@ -1079,11 +1210,30 @@ async function performChecks() {
         }
 
         let changes = 0;
+        const failed = [];
+        const gone = [];
 
         for (const session of sessions) {
-            const result = await checkEvent(session);
+            const check = await checkEvent(session);
 
-            if (result) {
+            if (check.status === 'error') {
+                // Сетевой сбой — не повод считать, что мест не стало: оставляем прошлую картину
+                failed.push(session.id);
+                await delay(CHECK_DELAY_MS);
+                continue;
+            }
+
+            if (check.status === 'gone') {
+                gone.push(session.id);
+                deadSessions.add(session.id);
+                currentResults.delete(session.id);
+                forgetNotified(session.id);
+                await delay(CHECK_DELAY_MS);
+                continue;
+            }
+
+            if (check.status === 'ok') {
+                const result = check.result;
                 const diff = diffSeats(result, currentResults.get(session.id));
                 currentResults.set(session.id, result);
 
@@ -1104,6 +1254,16 @@ async function performChecks() {
             }
 
             await delay(CHECK_DELAY_MS);
+        }
+
+        if (gone.length > 0) {
+            // Такие сеансы выпадут из списка при следующем обновлении расписания
+            sessions = sessions.filter(session => !deadSessions.has(session.id));
+            console.log(`🚫 Снято с продажи: ${gone.join(', ')}`);
+        }
+
+        if (failed.length > 0) {
+            console.log(`⚠️ Не удалось проверить сеансов: ${failed.length} (${failed.slice(0, 5).join(', ')}${failed.length > 5 ? '…' : ''})`);
         }
 
         console.log(`✅ Цикл завершён. Изменений: ${changes}`);
